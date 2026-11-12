@@ -1,20 +1,42 @@
 import json
+import hashlib
+import html
+import hmac
+import logging
 import os
 import re
+from datetime import datetime, timezone
 from typing import Annotated, Literal
 
 import httpx
+from firebase_admin import auth as firebase_auth
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.responses import RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
+from firebase_admin.exceptions import FirebaseError
+from google.auth.exceptions import DefaultCredentialsError
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 load_dotenv()
 
-from .auth import AuthUser, require_user  # noqa: E402
+from .auth import AuthUser, get_firebase_app, require_user  # noqa: E402
 from .advisor import AdvisorContext, compute_facts, deterministic_summary, system_prompt, unverified_figures  # noqa: E402
+from .google_calendar import (  # noqa: E402
+    GoogleCalendarError,
+    complete_authorization,
+    consume_authorization_state,
+    create_authorization_url,
+    disconnect_google_calendar,
+    frontend_result_url,
+    google_calendar_status,
+    sync_existing_interruption_notices,
+    upsert_interruption_event,
+)
 from .rentals.router import router as rentals_router  # noqa: E402
+from .rentals.store import AlreadyExistsError, firestore_store_from_env  # noqa: E402
 
+logger = logging.getLogger(__name__)
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 GOOGLE_TRANSLATE_URL = "https://translation.googleapis.com/language/translate/v2"
 MAX_MESSAGES = 12
@@ -101,6 +123,47 @@ class TranslationResponse(BaseModel):
     translations: list[str]
 
 
+class MeralcoEmailNotice(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    message_id: str = Field(min_length=1, max_length=500)
+    account_email: str = Field(min_length=3, max_length=254)
+    sender: str = Field(min_length=3, max_length=254)
+    subject: str = Field(min_length=1, max_length=300)
+    text: str = Field(min_length=1, max_length=20_000)
+    received_at: datetime | None = None
+    service_area: str | None = Field(default=None, max_length=160)
+    start_at: datetime | None = None
+    end_at: datetime | None = None
+
+    @field_validator("account_email")
+    @classmethod
+    def validate_account_email(cls, value: str) -> str:
+        clean = value.strip().lower()
+        if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", clean):
+            raise ValueError("A valid SmartWatts account email is required.")
+        return clean
+
+    @field_validator("sender")
+    @classmethod
+    def validate_meralco_sender(cls, value: str) -> str:
+        clean = value.strip().lower()
+        address = clean.rsplit("<", 1)[-1].rstrip(">").strip()
+        domain = address.rsplit("@", 1)[1] if "@" in address else ""
+        if domain != "meralco.com.ph" and not domain.endswith(".meralco.com.ph"):
+            raise ValueError("Only forwarded emails from a meralco.com.ph address are accepted.")
+        return value.strip()[:254]
+
+    @model_validator(mode="after")
+    def validate_event_times(self):
+        if any(value is not None and value.tzinfo is None for value in (self.start_at, self.end_at)):
+            raise ValueError("Interruption times must include a timezone offset.")
+        if self.start_at and self.end_at:
+            if self.end_at <= self.start_at:
+                raise ValueError("The interruption end time must be after its start time.")
+        return self
+
+
 app = FastAPI(title="SmartWatts API", version="2.0.0")
 allowed_origins = [
     origin.strip()
@@ -121,6 +184,158 @@ app.include_router(rentals_router)
 @app.get("/api/health")
 async def health():
     return {"status": "ok"}
+
+
+def _utility_notice_store():
+    store = firestore_store_from_env()
+    if store is None:
+        raise HTTPException(status_code=503, detail="Utility notice storage is not configured on the server.")
+    return store
+
+
+def _email_notice_kind(subject: str, text: str) -> str:
+    content = f"{subject} {text}".lower()
+    if re.search(r"\b(interruption|power outage|brownout|scheduled maintenance)\b", content):
+        return "interruption"
+    if re.search(r"\b(disconnection|disconnect notice|service cut[- ]?off)\b", content):
+        return "disconnection"
+    return "report"
+
+
+def _email_summary(text: str) -> str:
+    plain = html.unescape(re.sub(r"<[^>]*>", " ", text))
+    return re.sub(r"\s+", " ", plain).strip()[:500]
+
+
+@app.post("/api/inbound/meralco-email", status_code=202)
+async def receive_meralco_email(
+    notice: MeralcoEmailNotice,
+    webhook_secret: Annotated[str | None, Header(alias="X-Meralco-Webhook-Secret")] = None,
+):
+    configured_secret = os.getenv("MERALCO_EMAIL_WEBHOOK_SECRET", "").strip()
+    if not configured_secret:
+        raise HTTPException(status_code=503, detail="The MERALCO inbound-email webhook is not configured.")
+    if not webhook_secret or not hmac.compare_digest(webhook_secret, configured_secret):
+        raise HTTPException(status_code=401, detail="The inbound-email webhook secret is invalid.")
+
+    try:
+        user = firebase_auth.get_user_by_email(notice.account_email, app=get_firebase_app())
+    except firebase_auth.UserNotFoundError as error:
+        raise HTTPException(status_code=404, detail="No SmartWatts account matches the forwarded email recipient.") from error
+    except (DefaultCredentialsError, FirebaseError, ValueError) as error:
+        raise HTTPException(status_code=503, detail="Could not verify the forwarded email recipient.") from error
+    if not user.email_verified:
+        raise HTTPException(status_code=403, detail="The forwarded email recipient must be a verified SmartWatts account.")
+
+    received_at = notice.received_at or datetime.now(timezone.utc)
+    if received_at.tzinfo is None:
+        received_at = received_at.replace(tzinfo=timezone.utc)
+    document_id = hashlib.sha256(notice.message_id.encode("utf-8")).hexdigest()
+    document = {
+        "kind": _email_notice_kind(notice.subject, notice.text),
+        "subject": notice.subject.strip(),
+        "summary": _email_summary(notice.text),
+        "sender": notice.sender,
+        "receivedAt": received_at.astimezone(timezone.utc).isoformat(),
+        "serviceArea": notice.service_area.strip() if notice.service_area else None,
+        "startAt": notice.start_at.isoformat() if notice.start_at else None,
+        "endAt": notice.end_at.isoformat() if notice.end_at else None,
+    }
+    store = _utility_notice_store()
+    try:
+        store.create(f"users/{user.uid}/utilityNotices", document_id, document)
+        duplicate = False
+    except AlreadyExistsError:
+        duplicate = True
+        document = store.get(f"users/{user.uid}/utilityNotices", document_id) or document
+    if document.get("kind") == "interruption":
+        sync_status = "not_scheduled"
+        calendar_event_id = None
+        try:
+            sync_status, calendar_event_id = await upsert_interruption_event(
+                user.uid, document_id, document, store,
+            )
+        except GoogleCalendarError:
+            sync_status = "failed"
+            logger.exception("Could not sync MERALCO interruption notice %s to Google Calendar.", document_id)
+        sync_update = {
+            "calendarSync": sync_status,
+            "calendarSyncAt": datetime.now(timezone.utc).isoformat(),
+        }
+        if calendar_event_id:
+            sync_update["calendarEventId"] = calendar_event_id
+        store.update(f"users/{user.uid}/utilityNotices", document_id, sync_update)
+    return {"accepted": True, "duplicate": duplicate}
+
+
+@app.get("/api/utility-notices")
+def list_utility_notices(user: AuthUser = Depends(require_user)):
+    if user.is_anonymous or not user.email_verified:
+        raise HTTPException(status_code=403, detail="A verified email account is required to view private utility notices.")
+    notices = _utility_notice_store().query(f"users/{user.uid}/utilityNotices")
+    notices.sort(key=lambda item: item.get("receivedAt", ""), reverse=True)
+    return notices
+
+
+def require_verified_calendar_user(user: AuthUser = Depends(require_user)) -> AuthUser:
+    if user.is_anonymous or not user.email_verified:
+        raise HTTPException(status_code=403, detail="A verified email account is required to connect Google Calendar.")
+    return user
+
+
+@app.get("/api/google-calendar/status")
+def get_google_calendar_status(user: AuthUser = Depends(require_verified_calendar_user)):
+    return google_calendar_status(_utility_notice_store(), user.uid)
+
+
+@app.post("/api/google-calendar/authorize")
+def authorize_google_calendar(user: AuthUser = Depends(require_verified_calendar_user)):
+    try:
+        return {"authorizationUrl": create_authorization_url(user.uid, _utility_notice_store())}
+    except GoogleCalendarError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+
+
+@app.get("/api/google-calendar/callback", include_in_schema=False)
+async def google_calendar_callback(
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+):
+    result = "error"
+    if state:
+        try:
+            store = _utility_notice_store()
+            uid = consume_authorization_state(state, store)
+            if error:
+                result = "cancelled"
+            elif code:
+                await complete_authorization(uid, code, store)
+                result = "connected"
+                try:
+                    await sync_existing_interruption_notices(uid, store)
+                except GoogleCalendarError:
+                    logger.exception("Google Calendar connected, but existing interruption schedules could not be synced.")
+        except GoogleCalendarError:
+            logger.exception("Google Calendar authorization callback failed.")
+    return RedirectResponse(frontend_result_url(result), status_code=303)
+
+
+@app.post("/api/google-calendar/sync")
+async def sync_google_calendar(user: AuthUser = Depends(require_verified_calendar_user)):
+    try:
+        return await sync_existing_interruption_notices(user.uid, _utility_notice_store())
+    except GoogleCalendarError as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
+
+
+@app.post("/api/google-calendar/disconnect")
+async def unlink_google_calendar(user: AuthUser = Depends(require_verified_calendar_user)):
+    try:
+        await disconnect_google_calendar(user.uid, _utility_notice_store())
+    except GoogleCalendarError as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
+    return {"connected": False}
 
 
 async def google_translation_request(method: str, *, params: dict[str, str], payload: dict | None = None):

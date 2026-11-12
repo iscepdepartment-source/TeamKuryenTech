@@ -68,6 +68,25 @@ test("register appliances, simulate savings, and save a plan", async ({ page }) 
   await expect(page.locator('[data-slot="appliances"]')).toContainText("Bedroom aircon");
 });
 
+test("bill reductions add verified points after comparable bills are recorded", async ({ page }) => {
+  await page.locator("#navigation [data-page=bills]").click();
+  const saveBill = async (start: string, end: string, amount: string) => {
+    const form = page.locator('[data-form="bill-save"]');
+    await form.getByLabel("Period start").fill(start);
+    await form.getByLabel("Period end").fill(end);
+    await form.getByLabel("Billed kWh").fill("200");
+    await form.getByLabel("Total current charges (₱)").fill(amount);
+    await form.getByRole("button", { name: "Save bill" }).click();
+    await expect(page.locator('[data-slot="bills"]')).toContainText(`₱${amount}`);
+  };
+
+  await saveBill("2026-09-01", "2026-09-30", "1,000.00");
+  await saveBill("2026-10-01", "2026-10-31", "900.00");
+  await page.locator("#navigation [data-page=dashboard]").click();
+  await expect(page.locator(".game-stats")).toContainText("13");
+  await expect(page.locator(".game-challenge")).toContainText("Bill-based points");
+});
+
 test("user-entered text is escaped, not executed", async ({ page }) => {
   await page.getByRole("button", { name: "My Appliances" }).click();
   const form = page.locator('[data-form="appliance-save"]');

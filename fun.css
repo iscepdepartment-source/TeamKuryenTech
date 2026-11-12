@@ -1090,6 +1090,10 @@ body.theme-dark .sidebar {
   border-right-color: #453e33;
 }
 
+body.theme-dark .brand b {
+  color: #fff;
+}
+
 body.theme-dark .nav-label,
 body.theme-dark .table th {
   color: #b7aa95;

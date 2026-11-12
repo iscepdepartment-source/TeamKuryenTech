@@ -14,24 +14,21 @@ test("dashboard loads and chat supports Tagalog selection", async ({ page }) => 
   await expect(page.getByRole("heading", { name: "Good morning, Rean Justine!" })).toBeVisible();
   await expect(page.getByRole("button", { name: /Complete quest/ })).toBeVisible();
   await page.getByRole("button", { name: /Complete quest/ }).click();
-  await expect(page.locator(".game-stats")).toContainText("140");
+  await expect(page.locator(".game-stats")).toContainText("1/1");
+  await expect(page.locator(".game-stats")).toContainText("0");
   await page.reload();
-  await expect(page.locator(".game-stats")).toContainText("140");
+  await expect(page.locator(".game-stats")).toContainText("1/1");
   await page.getByRole("button", { name: "Energy Goals" }).click();
   await expect(page.getByLabel("Monthly target (kWh)")).toHaveValue("320");
   await page.getByLabel("Monthly target (kWh)").fill("300");
   await page.getByRole("button", { name: "Save target" }).click();
-  await expect(page.locator(".goal-copy")).toContainText("42.18 kWh over your monthly target");
+  await expect(page.locator(".goal-copy")).toContainText("No bill recorded");
   await page.reload();
   await page.getByRole("button", { name: "Energy Goals" }).click();
   await expect(page.getByLabel("Monthly target (kWh)")).toHaveValue("300");
-  await page.getByRole("button", { name: /Claim/ }).first().click();
-  await expect(page.locator(".stats")).toContainText("170");
+  await expect(page.getByRole("button", { name: /Done today/ })).toBeDisabled();
   await page.getByRole("button", { name: "Rewards & Badges" }).click();
   await expect(page.locator(".panel").filter({ hasText: "First Step" })).toContainText("✓ Unlocked");
-  const coolOperatorBadge = page.locator(".panel").filter({ hasText: "Cool Operator" });
-  await expect(coolOperatorBadge).toContainText("✓ Unlocked");
-  await expect(coolOperatorBadge).toContainText("2/8 earned");
   await expect(page.getByRole("heading", { name: "Neighborhood leaderboard" })).toHaveCount(0);
   await page.getByRole("button", { name: "Chat with us" }).click();
   await page.getByLabel("Language", { exact: true }).selectOption("tl");
@@ -62,6 +59,7 @@ test("system language, usage ranges, and theme preferences work across pages", a
 
   await page.locator("#themeToggle").click();
   await expect(page.locator("body")).toHaveClass(/theme-dark/);
+  await expect(page.locator(".brand b")).toHaveCSS("color", "rgb(255, 255, 255)");
   await expect.poll(() => page.locator(".panel").first().evaluate(
     (element) => getComputedStyle(element).backgroundColor,
   )).toBe("rgb(36, 33, 28)");
@@ -98,6 +96,47 @@ test("mobile top bar stays compact and dark surfaces remain dark", async ({ page
   await expect.poll(() => page.locator(".stat-card").first().evaluate(
     (element) => getComputedStyle(element).backgroundImage,
   )).toContain("rgb(36, 33, 28)");
+});
+
+test("notification drawer toggles closed and stays scrollable above mobile navigation", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto("/");
+
+  const bell = page.locator("#notificationToggle");
+  const drawer = page.getByRole("region", { name: "Recent notifications" });
+  await bell.click();
+  await expect(drawer).toBeVisible();
+  await expect(bell).toHaveAttribute("aria-expanded", "true");
+  await page.locator("#notificationPopoverItems").evaluate((element) => {
+    element.innerHTML = Array.from({ length: 20 }, (_, i) => `<div class="alert"><div><strong>Notice ${i}</strong><p>Long notice text to exercise drawer scrolling on a mobile viewport.</p></div></div>`).join("");
+  });
+  const drawerBox = await drawer.boundingBox();
+  const tabbarBox = await page.locator(".mobile-tabbar").boundingBox();
+  expect(drawerBox).not.toBeNull();
+  expect(tabbarBox).not.toBeNull();
+  expect(drawerBox!.y + drawerBox!.height).toBeLessThanOrEqual(tabbarBox!.y);
+  expect(await drawer.evaluate((element) => element.scrollHeight > element.clientHeight)).toBe(true);
+
+  await bell.click();
+  await expect(drawer).toBeHidden();
+  await bell.click();
+  await page.locator("#pageTitle").click();
+  await expect(drawer).toBeHidden();
+});
+
+test("utility notice calendar explains its verified email requirement", async ({ page }) => {
+  await page.goto("/");
+  await page.locator("#navigation [data-page=utility-notices]").click();
+
+  await expect(page.locator("#pageTitle")).toHaveText("Interruption Calendar & Notices");
+  await expect(page.getByText("Sign in with a verified email account to view private MERALCO notices.")).toBeVisible();
+});
+
+test("Google Calendar authorization returns to the interruption notices page", async ({ page }) => {
+  await page.goto("/?googleCalendar=connected");
+
+  await expect(page.locator("#pageTitle")).toHaveText("Interruption Calendar & Notices");
+  await expect(page).not.toHaveURL(/googleCalendar=/);
 });
 
 test("support page provides MERALCO contact links", async ({ page }) => {

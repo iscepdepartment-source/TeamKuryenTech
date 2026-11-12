@@ -22,6 +22,28 @@ SmartWatts is a responsive electricity dashboard with the classic SmartWatts UI 
 
 Without Firebase settings the dashboard runs with sample data. Firestore guest accounts use per-user paths and Firestore's IndexedDB cache for offline reading access and writes.
 
+## MERALCO email notices
+
+The app's notification drawer checks the backend for private utility notices while SmartWatts is open. To ingest emails, configure an inbound-email provider or forwarding rule to POST its normalized payload to `/api/inbound/meralco-email`, and set the backend-only `MERALCO_EMAIL_WEBHOOK_SECRET`. SmartWatts does not connect to or read a Gmail/Outlook inbox directly.
+
+The webhook requires `X-Meralco-Webhook-Secret` and a JSON payload containing `message_id`, `account_email` (the verified SmartWatts account receiving the notice), `sender`, `subject`, and plain-text `text`. Optional `service_area`, `start_at`, and `end_at` fields populate the interruption calendar when the email provider can reliably extract them; event times must include an ISO-8601 timezone offset (for example, `2026-10-12T09:00:00+08:00`). Only `meralco.com.ph` sender addresses are accepted; configure the provider to verify sender authenticity as well, since an email's visible sender can be forged. Messages are stored under the matching user's private Firestore path; the raw email body is not retained. Forwarding rules must route messages to the correct account email. The provider and routing must be configured and tested in the deployment before live alerts are available.
+
+### Google Calendar schedule sync
+
+On the Interruption Calendar & Notices page, a verified SmartWatts account can connect Google Calendar. SmartWatts then creates or updates private events on the connected account's **primary calendar** for interruption notices with both start and end times. Connecting also syncs existing eligible notices; later forwarded notices sync automatically. The provider must supply accurate date/time values and timezone offsets. Disconnecting stops future sync and revokes the connection but does not delete events already created.
+
+Before enabling this in a deployment:
+
+1. Enable the Google Calendar API in the Google Cloud project and configure the OAuth consent screen.
+2. Create a Google OAuth **Web application** client. Register `GOOGLE_CALENDAR_REDIRECT_URI` as an authorized redirect URI (local default: `http://localhost:8000/api/google-calendar/callback`).
+3. Configure `GOOGLE_CALENDAR_CLIENT_ID`, the backend-only `GOOGLE_CALENDAR_CLIENT_SECRET`, the exact `GOOGLE_CALENDAR_REDIRECT_URI`, and `SMARTWATTS_FRONTEND_URL`. Use HTTPS for production.
+4. Generate a dedicated 32-byte URL-safe key for `GOOGLE_CALENDAR_TOKEN_ENCRYPTION_KEY`, for example with `python -c "import base64,secrets; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip('='))"`. Store it in the server's secret manager; never commit it or share it with the frontend.
+5. Ensure backend Firebase Admin credentials and Firestore are configured. Google refresh tokens are encrypted before being stored in the user's private Firestore integration record.
+
+SmartWatts requests the `calendar.events` scope only. Users must explicitly connect their own Google account; the app never reads their calendar contents. Google may require OAuth consent-screen testing or verification before external users can connect.
+
+Daily missions are action goals and reset each local day. Watts points are earned only from recorded bills: comparable billing periods are normalized to an average month, positive reductions accumulate, and every ₱10 reduced earns 1 point. Daily actions do not claim unmeasured savings; reductions are confirmed after a lower bill is recorded.
+
 ## Run locally
 
 In the project root:
@@ -84,6 +106,12 @@ Tenant billing workflows require legal and regulatory review before production u
 | `VITE_MAPBOX_ACCESS_TOKEN` | Optional public (`pk.*`) Mapbox token for the Business Center map. Restrict it to your domains. |
 | `VITE_USE_FIREBASE_EMULATORS` | `true` to use the local Firebase emulators (tests). |
 | `FIREBASE_STORAGE_BUCKET` | Optional bucket for rental bill documents (backend only). |
+| `MERALCO_EMAIL_WEBHOOK_SECRET` | Backend-only shared secret required by the inbound utility email webhook. |
+| `GOOGLE_CALENDAR_CLIENT_ID` | Google OAuth Web application client ID. |
+| `GOOGLE_CALENDAR_CLIENT_SECRET` | Backend-only Google OAuth client secret. |
+| `GOOGLE_CALENDAR_REDIRECT_URI` | OAuth callback URL registered in Google Cloud. |
+| `GOOGLE_CALENDAR_TOKEN_ENCRYPTION_KEY` | Backend-only 32-byte URL-safe key used to encrypt Google refresh tokens. |
+| `SMARTWATTS_FRONTEND_URL` | Frontend origin where the OAuth callback returns the user. |
 | `RENTALS_PRICE_CENTAVOS`, `RENTALS_UNIT_LIMIT`, `RENTALS_TRIAL_DAYS` | Rentals plan price, unit limit, and optional development trial (defaults 29900, 10, 0). |
 
 ### Checks

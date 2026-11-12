@@ -7,6 +7,7 @@ import {
   saveMonthlyEnergyTarget,
   renderGameChrome,
   rewardsPage,
+  syncBillSavings,
   setGameCallbacks,
 } from "./game.js";
 import { getLanguage, getSupportedLanguages, loadSupportedLanguages, setLanguage, translateText, translateTree } from "./i18n.js";
@@ -19,6 +20,8 @@ import { calendarActions, calendarPages } from "./calendar-view.js";
 import { getWorkspace, loadWorkspaces, setWorkspace, workspaceOptions } from "./workspace.js";
 import { currentAccount, onAccountChange } from "./src/lib/account.ts";
 import { escapeHtml } from "./src/lib/format.ts";
+import { listBills } from "./src/lib/personal/store.ts";
+import { listUtilityNotices } from "./src/lib/utility-notices.ts";
 
 // Navigation and screen copy
 // Tier 1 — SmartWatts Personal (free forever)
@@ -30,6 +33,7 @@ const personalNavigation = [
       ["realtime", "activity", "Usage Patterns"],
       ["history", "history", "Usage History"],
       ["calendar", "clock", "Consumption Calendar"],
+      ["utility-notices", "bell", "Interruption Calendar & Notices"],
       ["breakdown", "chart-no-axes-column-increasing", "Analytics"],
       ["devices", "plug-zap", "My Appliances"],
     ],
@@ -119,7 +123,7 @@ const tenantNavigation = [
 
 const modulePages = { ...personalPages, ...rentalPages, ...locatorPages, ...calendarPages };
 const workspaceHome = { personal: "dashboard", owner: "rental-overview", tenant: "tenant-statements" };
-const alwaysAvailable = new Set(["account", "support", "plans", "join", "rentals-start", "about", "notifications", "business-centers"]);
+const alwaysAvailable = new Set(["account", "support", "plans", "join", "rentals-start", "about", "notifications", "utility-notices", "business-centers"]);
 
 function currentNavigation() {
   const { type } = getWorkspace();
@@ -139,6 +143,7 @@ const pageTitles = {
   billing: ["Billing & Payments", "Review your estimated bill and payment details."],
   rates: ["Rates Overview", "Understand your electricity rate and charges."],
   notifications: ["Notifications", "Stay updated with usage alerts and account activity."],
+  "utility-notices": ["Interruption Calendar & Notices", "Private interruption, disconnection, and email reports."],
   account: ["Account Settings", "Manage your profile and account preferences."],
   support: ["Help & Support", "Find answers or contact the SmartWatts support team."],
   about: ["About Team", "Meet the people and purpose behind SmartWatts."],
@@ -161,12 +166,9 @@ const historyRecords = [
   ["Dec 1 – Dec 31, 2025", "355.62 kWh", "₱1,304.50", "Paid"],
 ];
 
-const notificationItems = [
-  ["triangle-alert", "Sample Usage Alert", "Sample: this month's usage is 12% higher than last month.", "9:15 AM"],
-  ["receipt-text", "Bill is Ready", "Your May 2026 bill is now available.", "Yesterday"],
-  ["circle-check", "Payment Received", "Thank you! Your payment of ₱1,150.00 was successful.", "Apr 15"],
-  ["receipt-text", "Bill Reminder", "Upload your latest bill to keep your history up to date.", "Apr 12"],
-];
+let notificationItems = [];
+let previouslySeenNoticeIds = null;
+let noticeLoadErrorShown = false;
 
 // Inline SVG paths keep the icon set dependency-free.
 const iconPaths = {
@@ -205,7 +207,10 @@ const iconPaths = {
 };
 
 // App state and shared rendering helpers
-let currentPage = "dashboard";
+let googleCalendarResult = new URLSearchParams(window.location.search).get("googleCalendar");
+if (!["connected", "cancelled", "error"].includes(googleCalendarResult)) googleCalendarResult = null;
+if (googleCalendarResult) window.history.replaceState({}, "", `${window.location.pathname}${window.location.hash}`);
+let currentPage = googleCalendarResult ? "utility-notices" : "dashboard";
 let charts = [];
 
 const $ = (selector) => document.querySelector(selector);
@@ -463,18 +468,82 @@ function deviceTable() {
     </table>`;
 }
 
-function notificationList(items = notificationItems) {
-  return items
-    .map(
-      ([iconName, title, message, time]) => `
-        <div class="alert">
-          <div class="alert-icon">${icon(iconName, 18)}</div>
-          <div style="flex:1">
-            <time>${time}</time><strong>${title}</strong><p>${message}</p>
-          </div>
-        </div>`,
-    )
-    .join("");
+function notificationList(items = notificationItems, interactive = false) {
+  if (!items.length) return '<p class="muted-note">No forwarded utility notices yet.</p>';
+  return items.map((item) => {
+    const iconName = item.kind === "interruption" ? "triangle-alert" : item.kind === "disconnection" ? "receipt-text" : "bell";
+    const date = new Date(item.receivedAt);
+    const time = Number.isNaN(date.getTime()) ? "" : date.toLocaleString("en-PH", { dateStyle: "medium", timeStyle: "short" });
+    const tag = interactive ? "button" : "div";
+    const attrs = interactive ? ' type="button" data-page="utility-notices" aria-label="Open utility notice"' : "";
+    return `
+      <${tag} class="alert${item.readAt || item.locallyRead ? "" : " alert-unread"}${interactive ? " notification-item" : ""}"${attrs}>
+        <div class="alert-icon">${icon(iconName, 18)}</div>
+        <div style="flex:1">
+          <time>${escapeHtml(time)}</time><strong>${escapeHtml(item.subject)}</strong><p>${escapeHtml(item.summary)}</p>
+        </div>
+      </${tag}>`;
+  }).join("");
+}
+
+function updateNotificationSurfaces() {
+  const unread = notificationItems.filter((item) => !item.readAt && !item.locallyRead).length;
+  const count = $("#notificationCount");
+  count.hidden = unread === 0;
+  count.textContent = unread > 99 ? "99+" : String(unread);
+  const popoverItems = $("#notificationPopoverItems");
+  if (popoverItems) popoverItems.innerHTML = notificationList(notificationItems.slice(0, 5), true);
+  const dashboardList = document.querySelector("[data-notification-list='dashboard']");
+  if (dashboardList) dashboardList.innerHTML = notificationList(notificationItems.slice(0, 3));
+  const pageList = $("#notificationPageList");
+  if (pageList) pageList.innerHTML = notificationList(notificationItems);
+}
+
+function setUtilityNotices(notices) {
+  const ids = new Set(notices.map((item) => item.id));
+  const hasNew = previouslySeenNoticeIds && [...ids].some((id) => !previouslySeenNoticeIds.has(id));
+  previouslySeenNoticeIds = ids;
+  let readIds = [];
+  try {
+    const stored = JSON.parse(localStorage.getItem("smartwatts-read-notices") || "[]");
+    if (Array.isArray(stored)) readIds = stored.filter((id) => typeof id === "string");
+  } catch {
+    readIds = [];
+  }
+  notificationItems = notices.map((item) => ({ ...item, locallyRead: readIds.includes(item.id) }));
+  updateNotificationSurfaces();
+  if (hasNew) toast("New MERALCO notice received.");
+  return notificationItems;
+}
+
+async function refreshUtilityNotices() {
+  const account = currentAccount();
+  if (!account.permanent || !account.emailVerified) {
+    previouslySeenNoticeIds = null;
+    setUtilityNotices([]);
+    return;
+  }
+  try {
+    setUtilityNotices(await listUtilityNotices());
+    noticeLoadErrorShown = false;
+  } catch (error) {
+    if (!noticeLoadErrorShown) {
+      noticeLoadErrorShown = true;
+      toast(`Could not load utility notices: ${error instanceof Error ? error.message : "Please try again."}`);
+    }
+  }
+}
+
+function markAllNotificationsRead() {
+  notificationItems = notificationItems.map((item) => ({ ...item, locallyRead: true }));
+  let persisted = true;
+  try {
+    localStorage.setItem("smartwatts-read-notices", JSON.stringify(notificationItems.map((item) => item.id)));
+  } catch {
+    persisted = false;
+  }
+  updateNotificationSurfaces();
+  return persisted;
 }
 
 function historyTable() {
@@ -520,7 +589,7 @@ function dashboardPage() {
       </div>
       <div class="right-stack">
         ${panel("Account Overview", `<div class="detail-list">${detail("Account Name", "Rean Justine O. Baulite")}${detail("Account Number", "1234 5678 9012")}${detail("Service Address", "123 Main St., Brgy. 123, Makati City, Metro Manila")}${detail("Rate", "Residential")}</div><button class="btn btn-outline" style="width:100%;margin-top:17px" data-page="account">View Account Details</button>`)}
-        ${panel("Alerts & Notifications", notificationList(notificationItems.slice(0, 3)), `<button class="text-link" data-page="notifications">View all</button>`)}
+        ${panel("Alerts & Notifications", `<div data-notification-list="dashboard">${notificationList(notificationItems.slice(0, 3))}</div>`, `<button class="text-link" data-page="utility-notices">View all</button>`)}
         ${panel("Bill Estimate", `<div class="stat-label">Based on your current usage</div><div class="bill-amount">₱1,256.34</div><div class="progress"><span></span></div><div class="detail-list" style="margin:13px 0">${detail("Due Date", "May 20, 2026")}${detail("Billing Period", "Apr 1 – Apr 30, 2026")}</div><button class="btn btn-primary" style="width:100%" data-page="billing">View Bill & Pay</button>`)}
       </div>
     </div>`;
@@ -625,10 +694,9 @@ function ratesPage() {
 }
 
 function notificationsPage() {
-  const allNotifications = [...notificationItems, ...notificationItems.slice(0, 2)];
   return `
     ${pageHead("Alerts & notifications", "Recent updates about your electricity account.", `<button class="btn btn-outline" data-action="markRead">Mark all as read</button>`)}
-    ${panel("Recent Activity", notificationList(allNotifications))}`;
+    ${panel("Recent Activity", `<div id="notificationPageList">${notificationList()}</div>`)}`;
 }
 
 function accountPage() {
@@ -736,6 +804,7 @@ const pageContext = {
   render: () => render(),
   translate: (root) => translateTree(root, getLanguage()),
   state: pageState,
+  setUtilityNotices: (notices) => setUtilityNotices(notices),
   accountChanged: () => refreshWorkspaces(),
 };
 
@@ -774,10 +843,16 @@ function guardedRoot(element, sequence) {
 function runPageLoader(content) {
   const sequence = ++loadSequence;
   const loader = modulePages[currentPage]?.load ?? personalLoaders[currentPage];
-  if (!loader) return;
+  const syncGame = ["dashboard", "goals", "rewards", "bills"].includes(currentPage);
+  if (!loader && !syncGame) return;
   const root = guardedRoot(content, sequence);
   Promise.resolve()
-    .then(() => loader(pageContext, root))
+    .then(() => loader?.(pageContext, root))
+    .then(async () => {
+      if (!syncGame || root.isStale) return;
+      const bills = await listBills();
+      if (!root.isStale && syncBillSavings(bills)) pageContext.render();
+    })
     .catch((error) => {
       if (sequence !== loadSequence) return;
       const message = error instanceof Error ? error.message : "Could not load this page.";
@@ -816,6 +891,7 @@ function render() {
   const modulePage = modulePages[currentPage];
   const content = $("#content");
   content.innerHTML = modulePage ? modulePage.render(pageContext) : pageRenderers[currentPage]();
+  updateNotificationSurfaces();
   document.body.classList.toggle("workspace-rental", getWorkspace().type !== "personal");
   renderCharts();
   renderGameChrome(currentPage);
@@ -850,7 +926,23 @@ function closeSidebar() {
   $("#menuToggle").setAttribute("aria-expanded", "false");
 }
 
+function closeNotificationPopover() {
+  const popover = $("#notificationPopover");
+  popover.hidden = true;
+  document.body.classList.remove("notification-open");
+  $("#notificationToggle").setAttribute("aria-expanded", "false");
+}
+
+function toggleNotificationPopover() {
+  const popover = $("#notificationPopover");
+  const open = popover.hidden;
+  popover.hidden = !open;
+  document.body.classList.toggle("notification-open", open);
+  $("#notificationToggle").setAttribute("aria-expanded", String(open));
+}
+
 function navigate(page) {
+  closeNotificationPopover();
   if (!pageTitles[page]) return;
   const workspace = getWorkspace();
   if (!pageIdsOf(currentNavigation()).has(page) && !alwaysAvailable.has(page)) {
@@ -870,11 +962,17 @@ const actionMessages = {
   export: "Demo export prepared. Connect a backend to download real records.",
   download: "Sample statement download is not connected yet.",
   pay: "SmartWatts does not process payments. Pay through your electric utility's official channels.",
-  markRead: "All notifications marked as read.",
   challengeDone: "You have already completed today's sample challenge.",
 };
 
 document.addEventListener("click", (event) => {
+  const notificationToggle = event.target.closest?.("#notificationToggle");
+  if (notificationToggle) {
+    toggleNotificationPopover();
+    return;
+  }
+  if (!event.target.closest?.(".notification-anchor")) closeNotificationPopover();
+
   const questButton = event.target.closest("[data-quest]");
   if (questButton) {
     claimQuest(questButton.dataset.quest, questButton);
@@ -904,6 +1002,14 @@ document.addEventListener("click", (event) => {
 
   const actionButton = event.target.closest("[data-action]");
   if (actionButton) {
+    if (actionButton.dataset.action === "markRead") {
+      const persisted = markAllNotificationsRead();
+      closeNotificationPopover();
+      toast(persisted
+        ? "All notifications marked as read."
+        : "Notifications marked read for this session; browser storage is unavailable.");
+      return;
+    }
     toast(actionMessages[actionButton.dataset.action] || "Action selected.");
   }
 });
@@ -1064,16 +1170,24 @@ applyTheme(savedTheme);
 $("#ui-language").value = getLanguage();
 
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape") closeSidebar();
+  if (event.key === "Escape") {
+    closeSidebar();
+    closeNotificationPopover();
+  }
 });
 
 setGameCallbacks({ render, toast, pageHead, stat, panel, language: getLanguage });
 if (readInviteFromHash()) currentPage = "join";
 render();
+if (googleCalendarResult === "connected") toast("Google Calendar connected. Existing interruption schedules are syncing.");
+if (googleCalendarResult === "cancelled") toast("Google Calendar connection was cancelled.");
+if (googleCalendarResult === "error") toast("Google Calendar could not be connected. Check the setup and try again.");
 lastAccountKey = JSON.stringify([false, null, false, []]);
 onAccountChange(() => {
   refreshWorkspaces({ force: false }).catch(() => undefined);
+  refreshUtilityNotices();
 });
+window.setInterval(refreshUtilityNotices, 60_000);
 
 loadSupportedLanguages()
   .then((languages) => {

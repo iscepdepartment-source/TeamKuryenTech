@@ -1,7 +1,13 @@
+import hashlib
+from types import SimpleNamespace
+from urllib.parse import parse_qs, urlparse
+
 from fastapi.testclient import TestClient
 
 from app.auth import AuthUser
-from app.main import app, require_user
+from app.google_calendar import CALENDAR_SCOPE, TOKEN_URL
+from app.main import _email_notice_kind, app, require_user
+from app.rentals.store import InMemoryStore
 
 client = TestClient(app)
 
@@ -17,6 +23,211 @@ def test_health_endpoint():
     response = client.get("/api/health")
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+
+
+def test_inbound_meralco_email_becomes_a_private_idempotent_notice(monkeypatch):
+    monkeypatch.setenv("MERALCO_EMAIL_WEBHOOK_SECRET", "test-webhook-secret")
+    store = InMemoryStore()
+    monkeypatch.setattr("app.main.firestore_store_from_env", lambda: store)
+    monkeypatch.setattr("app.main.get_firebase_app", lambda: object())
+    monkeypatch.setattr(
+        "app.main.firebase_auth.get_user_by_email",
+        lambda _email, app: SimpleNamespace(uid="verified-user", email_verified=True),
+    )
+    payload = {
+        "message_id": "meralco-message-1",
+        "account_email": "user@example.com",
+        "sender": "alerts@meralco.com.ph",
+        "subject": "Scheduled power interruption",
+        "text": "Power interruption in Makati on October 12.",
+        "service_area": "Makati",
+        "start_at": "2026-10-12T09:00:00+08:00",
+        "end_at": "2026-10-12T11:00:00+08:00",
+    }
+
+    received = client.post(
+        "/api/inbound/meralco-email",
+        headers={"X-Meralco-Webhook-Secret": "test-webhook-secret"},
+        json=payload,
+    )
+    duplicate = client.post(
+        "/api/inbound/meralco-email",
+        headers={"X-Meralco-Webhook-Secret": "test-webhook-secret"},
+        json=payload,
+    )
+    assert received.status_code == 202
+    assert received.json() == {"accepted": True, "duplicate": False}
+    assert duplicate.status_code == 202
+    assert duplicate.json() == {"accepted": True, "duplicate": True}
+
+    app.dependency_overrides[require_user] = lambda: AuthUser(
+        uid="verified-user", sign_in_provider="password", email="user@example.com", email_verified=True,
+    )
+    try:
+        notices = client.get("/api/utility-notices")
+    finally:
+        app.dependency_overrides[require_user] = allow_test_guest
+    assert notices.status_code == 200
+    assert notices.json()[0]["kind"] == "interruption"
+    assert notices.json()[0]["serviceArea"] == "Makati"
+    assert "October 12" in notices.json()[0]["summary"]
+
+
+def test_inbound_meralco_email_rejects_bad_secret_and_non_meralco_sender(monkeypatch):
+    monkeypatch.setenv("MERALCO_EMAIL_WEBHOOK_SECRET", "test-webhook-secret")
+    payload = {
+        "message_id": "message",
+        "account_email": "user@example.com",
+        "sender": "alerts@meralco.com.ph",
+        "subject": "Notice",
+        "text": "A message",
+    }
+    unauthorized = client.post(
+        "/api/inbound/meralco-email",
+        headers={"X-Meralco-Webhook-Secret": "wrong-secret"},
+        json=payload,
+    )
+    payload["sender"] = "alerts@example.com"
+    invalid_sender = client.post(
+        "/api/inbound/meralco-email",
+        headers={"X-Meralco-Webhook-Secret": "test-webhook-secret"},
+        json=payload,
+    )
+
+    assert unauthorized.status_code == 401
+    assert invalid_sender.status_code == 422
+
+
+def test_private_utility_notices_require_a_verified_permanent_account():
+    response = client.get("/api/utility-notices")
+    assert response.status_code == 403
+
+
+def test_google_calendar_authorization_syncs_notices_and_stores_only_an_encrypted_refresh_token(monkeypatch):
+    monkeypatch.setenv("GOOGLE_CALENDAR_CLIENT_ID", "test-client-id")
+    monkeypatch.setenv("GOOGLE_CALENDAR_CLIENT_SECRET", "test-client-secret")
+    monkeypatch.setenv("GOOGLE_CALENDAR_REDIRECT_URI", "http://localhost:8000/api/google-calendar/callback")
+    monkeypatch.setenv("GOOGLE_CALENDAR_TOKEN_ENCRYPTION_KEY", "eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHg")
+    monkeypatch.setenv("SMARTWATTS_FRONTEND_URL", "http://localhost:5173")
+    store = InMemoryStore()
+    monkeypatch.setattr("app.main.firestore_store_from_env", lambda: store)
+    app.dependency_overrides[require_user] = lambda: AuthUser(
+        uid="verified-user", sign_in_provider="password", email="user@example.com", email_verified=True,
+    )
+    store.create("users/verified-user/utilityNotices", "notice-1", {
+        "kind": "interruption",
+        "subject": "Scheduled power interruption",
+        "summary": "Makati service area",
+        "serviceArea": "Makati",
+        "startAt": "2026-10-12T09:00:00+08:00",
+        "endAt": "2026-10-12T11:00:00+08:00",
+    })
+    requests = {"event_ids": set(), "event": None}
+
+    class MockResponse:
+        def __init__(self, status_code, data=None):
+            self.status_code = status_code
+            self.is_error = status_code >= 400
+            self.data = data or {}
+
+        def json(self):
+            return self.data
+
+    class MockAsyncClient:
+        def __init__(self, *, timeout):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def post(self, url, *, data=None, headers=None, json=None):
+            if url == TOKEN_URL:
+                if data["grant_type"] == "authorization_code":
+                    return MockResponse(200, {
+                        "access_token": "initial-access",
+                        "refresh_token": "refresh-token-secret",
+                    })
+                return MockResponse(200, {"access_token": "calendar-access"})
+            requests["event"] = json
+            requests["event_ids"].add(json["id"])
+            return MockResponse(200, {"id": json["id"]})
+
+        async def get(self, url, *, headers=None):
+            event_id = url.rsplit("/", maxsplit=1)[-1]
+            return MockResponse(200 if event_id in requests["event_ids"] else 404)
+
+        async def patch(self, _url, *, headers=None, json=None):
+            requests["event"] = json
+            return MockResponse(200)
+
+    monkeypatch.setattr("app.google_calendar.httpx.AsyncClient", MockAsyncClient)
+    try:
+        authorization = client.post("/api/google-calendar/authorize")
+        assert authorization.status_code == 200
+        query = parse_qs(urlparse(authorization.json()["authorizationUrl"]).query)
+        assert query["scope"] == [CALENDAR_SCOPE]
+        assert query["access_type"] == ["offline"]
+        callback = client.get(
+            "/api/google-calendar/callback",
+            params={"code": "auth-code", "state": query["state"][0]},
+            follow_redirects=False,
+        )
+        assert callback.status_code == 303
+        assert callback.headers["location"] == "http://localhost:5173/?googleCalendar=connected"
+        assert len(requests["event_ids"]) == 1
+        assert requests["event"]["start"]["dateTime"] == "2026-10-12T09:00:00+08:00"
+        assert store.get("users/verified-user/utilityNotices", "notice-1")["calendarSync"] == "synced"
+
+        integration = store.get("users/verified-user/integrations", "googleCalendar")
+        assert integration["connected"] is True
+        assert "refresh-token-secret" not in integration["encryptedRefreshToken"]
+        assert client.get("/api/google-calendar/status").json() == {"configured": True, "connected": True}
+        synced = client.post("/api/google-calendar/sync")
+        assert synced.status_code == 200
+        assert synced.json() == {"synced": 1, "skipped": 0, "failed": 0}
+        assert requests["event"]["summary"] == "Power interruption: Scheduled power interruption"
+        replayed = client.get(
+            "/api/google-calendar/callback",
+            params={"code": "auth-code", "state": query["state"][0]},
+            follow_redirects=False,
+        )
+        assert replayed.status_code == 303
+        assert replayed.headers["location"] == "http://localhost:5173/?googleCalendar=error"
+
+        monkeypatch.setenv("MERALCO_EMAIL_WEBHOOK_SECRET", "test-webhook-secret")
+        monkeypatch.setattr("app.main.get_firebase_app", lambda: object())
+        monkeypatch.setattr(
+            "app.main.firebase_auth.get_user_by_email",
+            lambda _email, app: SimpleNamespace(uid="verified-user", email_verified=True),
+        )
+        incoming = client.post(
+            "/api/inbound/meralco-email",
+            headers={"X-Meralco-Webhook-Secret": "test-webhook-secret"},
+            json={
+                "message_id": "new-interruption",
+                "account_email": "user@example.com",
+                "sender": "alerts@meralco.com.ph",
+                "subject": "New scheduled power interruption",
+                "text": "Power interruption in Pasig.",
+                "service_area": "Pasig",
+                "start_at": "2026-10-13T10:00:00+08:00",
+                "end_at": "2026-10-13T12:00:00+08:00",
+            },
+        )
+        assert incoming.status_code == 202
+        assert len(requests["event_ids"]) == 2
+        new_notice_id = hashlib.sha256(b"new-interruption").hexdigest()
+        assert store.get("users/verified-user/utilityNotices", new_notice_id)["calendarSync"] == "synced"
+    finally:
+        app.dependency_overrides[require_user] = allow_test_guest
+
+
+def test_email_notice_categories_include_disconnection_and_report():
+    assert _email_notice_kind("Disconnection notice", "Service cut-off scheduled.") == "disconnection"
+    assert _email_notice_kind("Your account statement", "A billing report is attached.") == "report"
 
 
 def test_chat_requires_a_server_api_key(monkeypatch):

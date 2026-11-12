@@ -150,6 +150,113 @@ body {
   min-height: calc(100vh - 180px);
 }
 
+body.notification-open .topbar {
+  z-index: 30;
+}
+
+.notification-anchor {
+  position: relative;
+}
+
+.notification-popover {
+  position: absolute;
+  top: calc(100% + 12px);
+  right: 0;
+  z-index: 31;
+  width: min(390px, calc(100vw - 24px));
+  max-height: min(600px, calc(100dvh - 170px));
+  overflow: auto;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: var(--clay-surface);
+  box-shadow: 0 14px 36px rgba(38, 31, 24, .2);
+}
+
+.notification-popover[hidden] {
+  display: none;
+}
+
+.notification-popover-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.notification-item {
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.notification-item:hover,
+.alert-unread {
+  background: var(--pale);
+  background: color-mix(in srgb, var(--pale) 65%, transparent);
+  border-radius: 10px;
+}
+
+.notification-view-all {
+  width: 100%;
+  margin-top: 8px;
+}
+
+.utility-notice-sections {
+  display: grid;
+  gap: 14px;
+}
+
+.utility-notice-sections .table-scroll {
+  overflow-x: auto;
+}
+
+.interruption-month {
+  margin-top: 16px;
+}
+
+.interruption-weekdays,
+.interruption-days {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+}
+
+.interruption-weekdays {
+  color: var(--muted);
+  font-size: 11px;
+  text-align: center;
+}
+
+.interruption-day {
+  min-width: 0;
+  min-height: 72px;
+  padding: 6px;
+  border: 1px solid var(--line);
+  overflow-wrap: anywhere;
+}
+
+.interruption-day.empty {
+  background: transparent;
+  border-color: transparent;
+}
+
+.interruption-day.has-interruption {
+  background: var(--pale);
+}
+
+.interruption-event {
+  display: block;
+  margin-top: 4px;
+  color: var(--orange);
+  font-size: 10px;
+  line-height: 1.3;
+}
+
 .stat-card,
 .panel {
   border: 1px solid rgba(240, 229, 214, .9);
@@ -508,6 +615,10 @@ body {
     top: auto;
     border-radius: 16px;
     padding: 10px 12px;
+  }
+
+  .notification-popover {
+    max-height: calc(100dvh - 300px);
   }
 
   .welcome h1 {
